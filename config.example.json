@@ -1,0 +1,19 @@
+{
+    "gmail_recipient": "tu_email@gmail.com",
+    "equipo_directo": [
+        "persona1@empresa.com",
+        "persona2@empresa.com",
+        "persona3@empresa.com"
+    ],
+    "dominios_filtrar": [
+        "ejemplo1.com",
+        "ejemplo2.com"
+    ],
+    "remitentes_filtrar": [
+        "noreply@ejemplo.com"
+    ],
+    "asuntos_filtrar": [
+        "newsletter",
+        "unsubscribe"
+    ]
+}

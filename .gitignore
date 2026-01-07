@@ -1,0 +1,69 @@
+# ===================================
+# CONFIGURACIÓN SENSIBLE
+# ===================================
+config.json
+
+# ===================================
+# ARCHIVOS ANTIGUOS Y DE PRUEBA
+# ===================================
+# Toda la carpeta de archivos archivados
+archive/
+
+# ===================================
+# PYTHON
+# ===================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+.env
+
+# ===================================
+# LOGS Y SALIDAS DEL SCRIPT
+# ===================================
+*.log
+outlook_digest_log.txt
+
+# ===================================
+# DATOS GENERADOS
+# ===================================
+# Archivos de análisis y reportes
+outlook_analysis_*.json
+outlook_analysis_*.txt
+outlook_sample_*.json
+outlook_sample_*.txt
+
+# Archivos de prueba HTML
+output_test.html
+
+# ===================================
+# CACHE DE OUTLOOK
+# ===================================
+outlook_cache/
+
+# ===================================
+# SISTEMA OPERATIVO
+# ===================================
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ===================================
+# IDE
+# ===================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
