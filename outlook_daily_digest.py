@@ -119,12 +119,14 @@ class OutlookDailyDigest:
         # Por ahora, mostrar todos los correos
         return True
     
-    def get_todays_emails(self, delete_otros=False):
+    def get_todays_emails(self, delete_otros=False, start_date=None, end_date=None):
         """
-        Obtiene los correos recibidos hoy.
+        Obtiene los correos recibidos en un rango de fechas.
         
         Args:
             delete_otros: Si True, elimina los correos clasificados como "Otros"
+            start_date: Fecha inicial (datetime.date). Si es None, usa hoy.
+            end_date: Fecha final (datetime.date). Si es None, usa hoy.
         
         Returns:
             Dict con emails categorizados
@@ -132,17 +134,32 @@ class OutlookDailyDigest:
         inbox = self.get_inbox()
         messages = inbox.Items
         
-        # Filtrar por fecha de hoy (desde las 00:00)
-        # Usar solo la fecha sin hora para evitar problemas de timezone
-        today = datetime.now().date()
-        yesterday = today - timedelta(days=1)
+        # Determinar rango de fechas
+        if start_date is None:
+            start_date = datetime.now().date()
+        if end_date is None:
+            end_date = datetime.now().date()
         
-        # Formato: solo fecha DD/MM/YYYY para capturar TODO el día
-        filter_string = f"[ReceivedTime] > '{yesterday.strftime('%d/%m/%Y')}'"
+        # Validar que start_date <= end_date
+        if start_date > end_date:
+            print(f"❌ Error: La fecha inicial ({start_date}) no puede ser posterior a la fecha final ({end_date})")
+            sys.exit(1)
+        
+        # Filtrar por rango de fechas
+        # Usar el día anterior al start_date para capturar todo el día inicial
+        filter_start = start_date - timedelta(days=1)
+        # Usar el día siguiente al end_date para capturar todo el día final
+        filter_end = end_date + timedelta(days=1)
+        
+        # Formato: DD/MM/YYYY para Outlook
+        filter_string = f"[ReceivedTime] > '{filter_start.strftime('%d/%m/%Y')}' AND [ReceivedTime] < '{filter_end.strftime('%d/%m/%Y')}'"
         messages = messages.Restrict(filter_string)
         messages.Sort("[ReceivedTime]", True)  # Más recientes primero
         
-        print(f"\n📊 Analizando correos desde {today.strftime('%Y-%m-%d')} 00:00:00")
+        if start_date == end_date:
+            print(f"\n📊 Analizando correos del {start_date.strftime('%Y-%m-%d')}")
+        else:
+            print(f"\n📊 Analizando correos del {start_date.strftime('%Y-%m-%d')} al {end_date.strftime('%Y-%m-%d')}")
         print(f"   Total de correos encontrados: {messages.Count}")
         
         # Categorizar correos
@@ -174,8 +191,8 @@ class OutlookDailyDigest:
                 is_unread = message.UnRead
                 conversation_id = message.ConversationID
                 
-                # Filtrar solo correos de HOY (excluir los de ayer que el filtro capturó)
-                if received_time.date() < today:
+                # Filtrar solo correos dentro del rango de fechas
+                if received_time.date() < start_date or received_time.date() > end_date:
                     continue
                 
                 # Aplicar filtros personalizados (UTEL, LinkedIn, asuntos, etc.)
@@ -329,17 +346,19 @@ class OutlookDailyDigest:
             'total_processed': total_processed
         }
     
-    def generate_html_report(self, email_data):
+    def generate_html_report(self, email_data, date_range_str=None):
         """
-        Genera un reporte HTML bonito con los correos del día.
+        Genera un reporte HTML bonito con los correos del día o rango de fechas.
         
         Args:
             email_data: Diccionario con correos categorizados
+            date_range_str: String con el rango de fechas a mostrar (opcional)
         
         Returns:
             String con HTML del reporte
         """
-        today = datetime.now().strftime('%d/%m/%Y')
+        if date_range_str is None:
+            date_range_str = datetime.now().strftime('%d/%m/%Y')
         
         equipo_directo = email_data['equipo_directo']
         otros_prioritarios = email_data['otros_prioritarios']
@@ -357,7 +376,7 @@ class OutlookDailyDigest:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Resumen Diario - {today}</title>
+    <title>Resumen Diario - {date_range_str}</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -549,7 +568,7 @@ class OutlookDailyDigest:
     <div class="container">
         <div class="header">
             <h1>📧 Resumen Diario de Correos</h1>
-            <p>{today}</p>
+            <p>{date_range_str}</p>
         </div>
         
         <div class="stats">
@@ -720,28 +739,43 @@ class OutlookDailyDigest:
             print(f"\n✗ Error al enviar el correo: {e}")
             return False
     
-    def generate_and_send_digest(self, delete_otros=False):
+    def generate_and_send_digest(self, delete_otros=False, start_date=None, end_date=None):
         """
-        Genera y envía el resumen diario.
+        Genera y envía el resumen diario o de un rango de fechas.
         
         Args:
             delete_otros: Si True, elimina los correos clasificados como "Otros"
+            start_date: Fecha inicial (datetime.date). Si es None, usa hoy.
+            end_date: Fecha final (datetime.date). Si es None, usa hoy.
         """
         print("\n" + "=" * 70)
         print("📧 GENERADOR DE RESUMEN DIARIO - OUTLOOK")
         print("=" * 70)
         print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         
-        # Obtener correos del día
-        email_data = self.get_todays_emails(delete_otros=delete_otros)
+        # Obtener correos del rango de fechas
+        email_data = self.get_todays_emails(delete_otros=delete_otros, start_date=start_date, end_date=end_date)
+        
+        # Determinar string de rango de fechas para el reporte
+        if start_date is None:
+            start_date = datetime.now().date()
+        if end_date is None:
+            end_date = datetime.now().date()
+        
+        if start_date == end_date:
+            date_range_str = start_date.strftime('%d/%m/%Y')
+            subject = f"📧 Resumen Diario - {date_range_str}"
+        else:
+            date_range_str = f"{start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
+            subject = f"📧 Resumen de Correos - {date_range_str}"
         
         # Generar HTML
         print("\n🎨 Generando reporte HTML...")
-        html_content = self.generate_html_report(email_data)
+        html_content = self.generate_html_report(email_data, date_range_str=date_range_str)
         
         # Enviar correo
         print(f"📤 Enviando resumen a {self.GMAIL_RECIPIENT}...")
-        success = self.send_digest_email(html_content)
+        success = self.send_digest_email(html_content, subject=subject)
         
         if success:
             print("\n" + "=" * 70)
@@ -765,9 +799,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos de uso:
-  python outlook_daily_digest.py              # Modo interactivo
-  python outlook_daily_digest.py --delete     # Modo automático con borrado
-  python outlook_daily_digest.py --no-delete  # Modo automático sin borrado
+  python outlook_daily_digest.py                                    # Modo interactivo
+  python outlook_daily_digest.py --delete                           # Hoy con borrado
+  python outlook_daily_digest.py --no-delete                        # Hoy sin borrado
+  python outlook_daily_digest.py --date 2026-01-14 --delete         # Día específico
+  python outlook_daily_digest.py --start-date 2026-01-14 --end-date 2026-01-15 --delete  # Rango
         """
     )
     
@@ -783,7 +819,59 @@ Ejemplos de uso:
         help='NO eliminar correos, solo generar resumen (modo automático)'
     )
     
+    parser.add_argument(
+        '--date',
+        type=str,
+        help='Procesar un día específico (formato: YYYY-MM-DD)'
+    )
+    
+    parser.add_argument(
+        '--start-date',
+        type=str,
+        help='Fecha inicial del rango (formato: YYYY-MM-DD)'
+    )
+    
+    parser.add_argument(
+        '--end-date',
+        type=str,
+        help='Fecha final del rango (formato: YYYY-MM-DD)'
+    )
+    
     args = parser.parse_args()
+    
+    # Parsear fechas si se proporcionaron
+    start_date = None
+    end_date = None
+    
+    if args.date:
+        # Si se especifica --date, usar esa fecha para start y end
+        try:
+            start_date = datetime.strptime(args.date, '%Y-%m-%d').date()
+            end_date = start_date
+        except ValueError:
+            print(f"❌ Error: Formato de fecha inválido '{args.date}'. Use YYYY-MM-DD")
+            sys.exit(1)
+    elif args.start_date or args.end_date:
+        # Si se especifica rango, parsear ambas fechas
+        if args.start_date:
+            try:
+                start_date = datetime.strptime(args.start_date, '%Y-%m-%d').date()
+            except ValueError:
+                print(f"❌ Error: Formato de fecha inválido '{args.start_date}'. Use YYYY-MM-DD")
+                sys.exit(1)
+        
+        if args.end_date:
+            try:
+                end_date = datetime.strptime(args.end_date, '%Y-%m-%d').date()
+            except ValueError:
+                print(f"❌ Error: Formato de fecha inválido '{args.end_date}'. Use YYYY-MM-DD")
+                sys.exit(1)
+        
+        # Si solo se especificó una fecha, usar la misma para ambas
+        if start_date and not end_date:
+            end_date = start_date
+        elif end_date and not start_date:
+            start_date = end_date
     
     # Determinar modo de operación
     if args.delete and args.no_delete:
@@ -833,7 +921,7 @@ Ejemplos de uso:
     digest = OutlookDailyDigest()
     
     # Generar y enviar
-    digest.generate_and_send_digest(delete_otros=delete_otros)
+    digest.generate_and_send_digest(delete_otros=delete_otros, start_date=start_date, end_date=end_date)
 
 
 if __name__ == "__main__":
