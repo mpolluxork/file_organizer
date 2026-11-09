@@ -15,5 +15,12 @@
     "asuntos_filtrar": [
         "newsletter",
         "unsubscribe"
-    ]
+    ],
+    "max_chars_vip": 5000,
+    "max_chars_otros": 3000,
+    "max_total_chars": 90000,
+    "calendar_enabled": true,
+    "calendar_body_chars": 1500,
+    "calendar_include_declined": false,
+    "calendar_tomorrow_from_hour": 18
 }

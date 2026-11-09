@@ -9,6 +9,7 @@ from collections import defaultdict
 import sys
 import json
 import os
+import re
 import html
 
 
@@ -36,6 +37,15 @@ class OutlookDailyDigest:
         self.DOMINIOS_FILTRAR = []
         self.REMITENTES_FILTRAR = []
         self.ASUNTOS_FILTRAR = []
+        # Límites de texto (caracteres) por correo y totales
+        self.MAX_CHARS_VIP = 5000
+        self.MAX_CHARS_OTROS = 3000
+        self.MAX_TOTAL_CHARS = 90000      # Gmail recorta mensajes HTML de ~102 KB
+        # Calendario
+        self.CALENDAR_ENABLED = True
+        self.CALENDAR_BODY_CHARS = 1500
+        self.CALENDAR_INCLUDE_DECLINED = False
+        self.CALENDAR_TOMORROW_FROM_HOUR = 18  # Desde esta hora se muestra el día siguiente
 
         if os.path.exists(config_path):
             try:
@@ -46,6 +56,13 @@ class OutlookDailyDigest:
                     self.DOMINIOS_FILTRAR = config.get('dominios_filtrar', [])
                     self.REMITENTES_FILTRAR = config.get('remitentes_filtrar', [])
                     self.ASUNTOS_FILTRAR = config.get('asuntos_filtrar', [])
+                    self.MAX_CHARS_VIP = config.get('max_chars_vip', self.MAX_CHARS_VIP)
+                    self.MAX_CHARS_OTROS = config.get('max_chars_otros', self.MAX_CHARS_OTROS)
+                    self.MAX_TOTAL_CHARS = config.get('max_total_chars', self.MAX_TOTAL_CHARS)
+                    self.CALENDAR_ENABLED = config.get('calendar_enabled', self.CALENDAR_ENABLED)
+                    self.CALENDAR_BODY_CHARS = config.get('calendar_body_chars', self.CALENDAR_BODY_CHARS)
+                    self.CALENDAR_INCLUDE_DECLINED = config.get('calendar_include_declined', self.CALENDAR_INCLUDE_DECLINED)
+                    self.CALENDAR_TOMORROW_FROM_HOUR = config.get('calendar_tomorrow_from_hour', self.CALENDAR_TOMORROW_FROM_HOUR)
                 print("✓ Configuración cargada desde config.json")
             except Exception as e:
                 print(f"⚠ Error al cargar config.json: {e}. Usando valores por defecto.")
@@ -119,6 +136,205 @@ class OutlookDailyDigest:
         # Por ahora, mostrar todos los correos
         return True
     
+    # ------------------------------------------------------------------
+    # Limpieza de texto
+    # ------------------------------------------------------------------
+    # Marcadores que indican el inicio de la cadena citada (mensajes anteriores)
+    _QUOTE_MARKERS = [
+        # -----Original Message----- / ----- Mensaje original ----- / Forwarded message
+        re.compile(r'^[ \t]*-{2,}[ \t]*(original message|mensaje original|forwarded message|mensaje reenviado)[ \t]*-{0,}', re.I | re.M),
+        # Línea de guiones bajos que Outlook pone antes del encabezado De:/From:
+        re.compile(r'^[ \t]*_{10,}[ \t]*$', re.M),
+        # Bloque de encabezado: De: ... Enviado el: ...  /  From: ... Sent: ...
+        re.compile(r'^[ \t]*\*{0,2}(de|from)\*{0,2}:[^\n]*\n(?:[^\n]*\n){0,3}?[ \t]*\*{0,2}(enviado( el)?|sent|fecha|date)\*{0,2}:', re.I | re.M),
+        # "El lun, 3 nov 2025 a las 10:00, Fulano <x@y> escribió:" / "On ... wrote:"
+        re.compile(r'^[ \t]*(el|on)\s[^\n]{0,250}\n?[^\n]{0,120}?(escribi[óo]|wrote):[ \t]*$', re.I | re.M),
+        # Primera línea citada con ">"
+        re.compile(r'^[ \t]*>', re.M),
+    ]
+    _URL_ANGLE = re.compile(r'<(https?://[^>\s]{60,})>')
+    _URL_BARE = re.compile(r'(?<![<\w])(https?://[^\s<>]{80,})')
+    _CID = re.compile(r'\[cid:[^\]]*\]', re.I)
+
+    @staticmethod
+    def _short_url(url):
+        """Acorta una URL larga (p. ej. SafeLinks) conservando solo el dominio."""
+        m = re.match(r'https?://([^/\s]+)', url)
+        return f"https://{m.group(1)}/…" if m else url[:40] + "…"
+
+    def clean_body(self, text, strip_quoted=True, keep_urls=False):
+        """
+        Limpia el cuerpo de un correo: quita la cadena citada (mensajes anteriores),
+        URLs enormes, referencias [cid:...] y saltos de línea excesivos.
+        Si al quitar la cadena no queda contenido útil, se conserva el texto completo
+        (p. ej. correos reenviados sin comentario propio).
+        """
+        if not text:
+            return ""
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+        if strip_quoted:
+            cut = len(text)
+            for pattern in self._QUOTE_MARKERS:
+                m = pattern.search(text)
+                if m and m.start() < cut:
+                    cut = m.start()
+            if len(text[:cut].strip()) >= 20:
+                text = text[:cut]
+
+        text = self._CID.sub('', text)
+        if not keep_urls:
+            text = self._URL_ANGLE.sub(lambda m: f"<{self._short_url(m.group(1))}>", text)
+            text = self._URL_BARE.sub(lambda m: self._short_url(m.group(1)), text)
+
+        lines = [ln.rstrip() for ln in text.split('\n')]
+        text = '\n'.join(lines)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+
+    @staticmethod
+    def truncate_text(text, limit):
+        """Recorta el texto a `limit` caracteres indicando cuánto se omitió."""
+        if len(text) <= limit:
+            return text, False
+        omitted = len(text) - limit
+        return text[:limit].rstrip() + f"\n[… texto truncado: {omitted} caracteres más]", True
+
+    # ------------------------------------------------------------------
+    # Calendario
+    # ------------------------------------------------------------------
+    def get_calendar_range(self, start_date=None, end_date=None):
+        """
+        Determina qué días de calendario mostrar.
+        - Con fechas explícitas: ese rango.
+        - Sin fechas: antes de CALENDAR_TOMORROW_FROM_HOUR no se incluye agenda (devuelve
+          None); después, muestra mañana (el digest nocturno se lee a la mañana
+          siguiente). Si "mañana" es sábado, se extiende hasta el lunes.
+        """
+        if start_date is not None or end_date is not None:
+            s = start_date or end_date
+            return s, (end_date or s)
+
+        now = datetime.now()
+        if now.hour >= self.CALENDAR_TOMORROW_FROM_HOUR or getattr(self, 'FORCE_CALENDAR', False):
+            first = now.date() + timedelta(days=1)
+            last = first
+            if first.weekday() == 5:  # sábado -> incluir hasta el lunes
+                last = first + timedelta(days=2)
+            return first, last
+        return None  # Corrida de la tarde: sin agenda
+
+    _ONLINE_LINK = re.compile(
+        r'https://(?:teams\.microsoft\.com/l/meetup-join/|[\w.-]*zoom\.us/j/|meet\.google\.com/|[\w.-]*webex\.com/)[^\s<>\]\)]+',
+        re.I)
+    _VIRTUAL_WORDS = re.compile(r'teams|zoom|meet\.google|google meet|webex|online|en l[ií]nea|virtual|videoconferencia', re.I)
+
+    def get_calendar_events(self, first_day, last_day):
+        """Obtiene las citas del calendario entre first_day y last_day (inclusive)."""
+        events = []
+        try:
+            calendar = self.namespace.GetDefaultFolder(9)  # 9 = olFolderCalendar
+            items = calendar.Items
+            # IMPORTANTE: IncludeRecurrences antes de Sort, si no las recurrentes no aparecen
+            items.IncludeRecurrences = True
+            items.Sort("[Start]")
+
+            range_begin = datetime.combine(first_day, datetime.min.time())
+            range_end = datetime.combine(last_day + timedelta(days=1), datetime.min.time())
+
+            # Filtro solo por fecha (formato que ya funciona en este equipo); el filtro
+            # fino por hora se hace en Python para no depender de la configuración regional.
+            pad_start = first_day - timedelta(days=1)
+            pad_end = last_day + timedelta(days=2)
+            restriction = (f"[Start] < '{pad_end.strftime('%d/%m/%Y')}' "
+                           f"AND [End] > '{pad_start.strftime('%d/%m/%Y')}'")
+            found = items.Restrict(restriction)
+
+            for item in found:
+                try:
+                    st, en = item.Start, item.End
+                    start = datetime(st.year, st.month, st.day, st.hour, st.minute)
+                    end = datetime(en.year, en.month, en.day, en.hour, en.minute)
+                    if not (start < range_end and end > range_begin):
+                        continue
+
+                    # 4 = olResponseDeclined; MeetingStatus 5/7 = cancelada
+                    if not self.CALENDAR_INCLUDE_DECLINED and item.ResponseStatus == 4:
+                        continue
+                    if item.MeetingStatus in (5, 7):
+                        continue
+
+                    raw_body = item.Body or ""
+                    online = self._ONLINE_LINK.search(raw_body)
+                    online_link = online.group(0) if online else ""
+                    online_kind = ""
+                    if online_link:
+                        for kind, key in (("Teams", "teams"), ("Zoom", "zoom"), ("Google Meet", "meet.google"), ("Webex", "webex")):
+                            if key in online_link.lower():
+                                online_kind = kind
+                                break
+
+                    # Separar partes virtuales y físicas de la ubicación
+                    loc_parts = [p.strip() for p in re.split(r'[;\n]', item.Location or "") if p.strip()]
+                    physical = [p for p in loc_parts if not self._VIRTUAL_WORDS.search(p)]
+                    virtual_in_loc = any(self._VIRTUAL_WORDS.search(p) for p in loc_parts)
+                    is_virtual = bool(online_link) or virtual_in_loc
+                    if is_virtual and physical:
+                        modality = "Híbrida"
+                    elif is_virtual:
+                        modality = "Virtual"
+                    elif physical:
+                        modality = "Presencial"
+                    else:
+                        modality = ""  # Sin ubicación indicada
+                    agenda = self._clean_meeting_body(raw_body)
+
+                    events.append({
+                        'subject': item.Subject or "(sin asunto)",
+                        'start': start,
+                        'end': end,
+                        'all_day': bool(item.AllDayEvent),
+                        'location': item.Location or "",
+                        'organizer': item.Organizer or "",
+                        'required': item.RequiredAttendees or "",
+                        'optional': item.OptionalAttendees or "",
+                        'agenda': agenda,
+                        'online_link': online_link,
+                        'online_kind': online_kind,
+                        'modality': modality,
+                        'physical_location': '; '.join(physical),
+                        'is_recurring': bool(item.IsRecurring),
+                        'is_free': item.BusyStatus == 0,
+                        'is_tentative': item.ResponseStatus == 2 or item.BusyStatus == 1,
+                    })
+                except Exception as e:
+                    print(f"  ⚠ Error leyendo una cita: {e}")
+                    continue
+
+            events.sort(key=lambda e: (not e['all_day'], e['start']))
+            print(f"\n🗓️  Citas encontradas ({first_day} a {last_day}): {len(events)}")
+        except Exception as e:
+            print(f"\n⚠ No se pudo leer el calendario: {e}")
+        return events
+
+    def _clean_meeting_body(self, text):
+        """Quita el texto estándar de Teams/Zoom del cuerpo de una cita, dejando la agenda."""
+        if not text:
+            return ""
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        cut = len(text)
+        for pattern in (
+            re.compile(r'^[ \t]*_{10,}[ \t]*$', re.M),
+            re.compile(r'^[ \t]*(microsoft teams|reuni[óo]n de microsoft teams)', re.I | re.M),
+            re.compile(r'^[ \t]*(join zoom meeting|unirse a la reuni[óo]n de zoom)', re.I | re.M),
+        ):
+            m = pattern.search(text)
+            if m and m.start() < cut:
+                cut = m.start()
+        text = self.clean_body(text[:cut], strip_quoted=False)
+        text, _ = self.truncate_text(text, self.CALENDAR_BODY_CHARS)
+        return text
+
     def get_todays_emails(self, delete_otros=False, start_date=None, end_date=None):
         """
         Obtiene los correos recibidos en un rango de fechas.
@@ -212,7 +428,9 @@ class OutlookDailyDigest:
                     'sender_name': sender_name,
                     'subject': subject,
                     'received_time': received_time,
-                    'body': body[:500],  # Primeros 500 caracteres
+                    # Texto del mensaje principal (sin la cadena citada). El recorte final
+                    # por categoría (VIP/Otros) se aplica al generar el HTML.
+                    'body': self.clean_body(body)[:max(self.MAX_CHARS_VIP, self.MAX_CHARS_OTROS) * 4],
                     'is_unread': is_unread,
                     'conversation_id': conversation_id,
                     'has_attachments': message.Attachments.Count > 0,
@@ -369,7 +587,27 @@ class OutlookDailyDigest:
         otros_by_sender = defaultdict(list)
         for email in otros_prioritarios:
             otros_by_sender[email['sender_name']].append(email)
-        
+
+        # Sección de agenda (se renderiza primero para conocer su tamaño)
+        calendar_html = self._render_calendar_html(
+            email_data.get('calendar'), email_data.get('calendar_label', ''))
+
+        # Presupuesto total de texto para no pasar el límite de Gmail (~102 KB).
+        # VIP se renderiza antes que Otros, así que tiene prioridad sobre el presupuesto.
+        num_cards = len(equipo_directo) + len(otros_prioritarios)
+        overhead = 10000 + 900 * num_cards + len(calendar_html)
+        state = {'budget': int((self.MAX_TOTAL_CHARS - overhead) * 0.92), 'cut': 0}
+
+        def body_html(email, limit):
+            """Texto del correo recortado al límite de su categoría y al presupuesto restante."""
+            if state['budget'] < limit:
+                limit = max(300, state['budget'])
+            text, was_cut = self.truncate_text(email['body'], limit)
+            state['budget'] -= len(text)
+            if was_cut:
+                state['cut'] += 1
+            return html.escape(text)
+
         html_output = f"""
 <!DOCTYPE html>
 <html lang="es">
@@ -504,6 +742,49 @@ class OutlookDailyDigest:
             padding: 10px;
             background-color: #f8f9fa;
             border-radius: 5px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }}
+        .section-title.agenda {{
+            border-bottom-color: #198754;
+            color: #198754;
+        }}
+        .day-heading {{
+            font-weight: 600;
+            font-size: 15px;
+            color: #198754;
+            margin: 15px 0 8px 0;
+        }}
+        .event-card {{
+            border: 1px solid #e9ecef;
+            border-left: 4px solid #198754;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 10px;
+            background-color: #f6fbf8;
+        }}
+        .event-time {{
+            font-size: 13px;
+            font-weight: 600;
+            color: #198754;
+        }}
+        .event-subject {{
+            font-size: 15px;
+            font-weight: 600;
+            color: #212529;
+            margin: 4px 0;
+        }}
+        .event-meta {{
+            font-size: 13px;
+            color: #6c757d;
+            line-height: 1.5;
+        }}
+        .trunc-notice {{
+            background-color: #fff3cd;
+            color: #664d03;
+            font-size: 13px;
+            padding: 10px 30px;
+            border-bottom: 1px solid #ffecb5;
         }}
         .badge {{
             display: inline-block;
@@ -589,8 +870,12 @@ class OutlookDailyDigest:
                 <div class="stat-label">Conversaciones</div>
             </div>
         </div>
+<!--TRUNC_NOTICE-->
 """
-        
+
+        # Sección Agenda (arriba, antes de los correos)
+        html_output += calendar_html
+
         # Sección Equipo Directo (VIP)
         html_output += """
         <div class="section">
@@ -610,11 +895,9 @@ class OutlookDailyDigest:
                 sender_email = html.escape(email['sender_email'])
                 subject = html.escape(email['subject'])
                 
-                # Limpiar el preview del body y escapar HTML
-                preview = html.escape(email['body']).replace('\r\n', ' ').replace('\n', ' ').strip()
-                if len(preview) > 200:
-                    preview = preview[:200] + '...'
-                
+                # Texto del correo (límite VIP), escapado para HTML
+                preview = body_html(email, self.MAX_CHARS_VIP)
+
                 # NO indentar el HTML para evitar anidación visual
                 html_output += f"""
 <div class="email-card vip">
@@ -669,11 +952,9 @@ class OutlookDailyDigest:
                     subject_escaped = html.escape(email['subject'])
                     sender_email_escaped = html.escape(email['sender_email'])
                     
-                    # Limpiar el preview del body y escapar HTML (igual que en VIP)
-                    preview = html.escape(email['body']).replace('\r\n', ' ').replace('\n', ' ').strip()
-                    if len(preview) > 200:
-                        preview = preview[:200] + '...'
-                    
+                    # Texto del correo (límite Otros), escapado para HTML
+                    preview = body_html(email, self.MAX_CHARS_OTROS)
+
                     html_output += f"""
                 <div class="email-list-item">
                     <div class="subject">{subject_escaped}{unread_badge}</div>
@@ -708,8 +989,104 @@ class OutlookDailyDigest:
 </html>
 """
         
+        # Aviso si se recortó texto (para el lector humano y para el agente)
+        if state['cut']:
+            notice = (f'<div class="trunc-notice">⚠ {state["cut"]} correo(s) tienen el texto recortado '
+                      f'(límite por correo: VIP {self.MAX_CHARS_VIP}, Otros {self.MAX_CHARS_OTROS} caracteres).</div>')
+        else:
+            notice = ''
+        html_output = html_output.replace('<!--TRUNC_NOTICE-->', notice)
+
         return html_output
-    
+
+    def _render_calendar_html(self, events, label):
+        """Genera la sección HTML de la agenda. Devuelve '' si el calendario está desactivado."""
+        if events is None:
+            return ''
+
+        out = """
+        <div class="section">
+            <div class="section-title agenda">
+                <span class="icon">🗓️</span>
+                <span>Agenda del día""" + (f" — {html.escape(label)}" if label else "") + """</span>
+            </div>
+"""
+        if not events:
+            out += """
+            <div class="empty-state">
+                <div class="icon">✨</div>
+                <p>No hay citas en el calendario para este día</p>
+            </div>
+        </div>
+"""
+            return out
+
+        dias = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo']
+        current_day = None
+        for ev in events:
+            day = ev['start'].date()
+            if ev['all_day']:
+                day_key = None  # Las de todo el día se agrupan primero sin encabezado de día
+            else:
+                day_key = day
+            multi_day = len({e['start'].date() for e in events}) > 1
+            if multi_day and day_key != current_day and day_key is not None:
+                current_day = day_key
+                out += f'<div class="day-heading">{dias[day.weekday()].capitalize()} {day.strftime("%d/%m/%Y")}</div>\n'
+
+            if ev['all_day']:
+                when = f"Todo el día ({ev['start'].strftime('%d/%m')})" if multi_day else "Todo el día"
+            else:
+                mins = int((ev['end'] - ev['start']).total_seconds() // 60)
+                dur = f"{mins // 60}h {mins % 60:02d}m" if mins >= 60 else f"{mins} min"
+                when = f"{ev['start'].strftime('%H:%M')} – {ev['end'].strftime('%H:%M')} ({dur})"
+
+            badges = ''
+            if ev['is_recurring']:
+                badges += '<span class="badge" style="background:#e9ecef;color:#495057;">Recurrente</span>'
+            if ev['is_tentative']:
+                badges += '<span class="badge" style="background:#fff3cd;color:#664d03;">Tentativa</span>'
+            if ev['is_free']:
+                badges += '<span class="badge" style="background:#e9ecef;color:#495057;">Libre</span>'
+
+            meta = []
+            icon = {"Virtual": "💻", "Presencial": "📍", "Híbrida": "🔀"}.get(ev['modality'], "")
+            if ev['modality']:
+                line = f"{icon} <b>{ev['modality']}</b>"
+                if ev['online_kind']:
+                    line += f" ({html.escape(ev['online_kind'])})"
+                if ev['physical_location']:
+                    line += f" — {html.escape(ev['physical_location'])}"
+                meta.append(line)
+            else:
+                meta.append("📍 Sin ubicación indicada")
+            if ev['organizer']:
+                meta.append(f"Organiza: {html.escape(ev['organizer'])}")
+            attendees = [a.strip() for a in ev['required'].split(';') if a.strip()]
+            if attendees:
+                shown = ', '.join(html.escape(a) for a in attendees[:15])
+                extra = f" (+{len(attendees) - 15} más)" if len(attendees) > 15 else ''
+                meta.append(f"Asistentes: {shown}{extra}")
+            if ev['online_link']:
+                kind = ev['online_kind'] or 'la reunión'
+                meta.append(f'🔗 <a href="{html.escape(ev["online_link"])}">Unirse a {html.escape(kind)}</a>')
+            meta_html = '<br>'.join(meta)
+
+            agenda_html = f'<div class="preview">{html.escape(ev["agenda"])}</div>' if ev['agenda'] else ''
+
+            out += f"""
+<div class="event-card">
+    <div class="event-time">🕐 {when}{badges}</div>
+    <div class="event-subject">{html.escape(ev['subject'])}</div>
+    <div class="event-meta">{meta_html}</div>
+    {agenda_html}
+</div>
+"""
+        out += """
+        </div>
+"""
+        return out
+
     def send_digest_email(self, html_content, subject=None):
         """
         Envía el resumen por correo electrónico.
@@ -739,15 +1116,19 @@ class OutlookDailyDigest:
             print(f"\n✗ Error al enviar el correo: {e}")
             return False
     
-    def generate_and_send_digest(self, delete_otros=False, start_date=None, end_date=None):
+    def generate_and_send_digest(self, delete_otros=False, start_date=None, end_date=None, save_only=False):
         """
         Genera y envía el resumen diario o de un rango de fechas.
-        
+
         Args:
             delete_otros: Si True, elimina los correos clasificados como "Otros"
             start_date: Fecha inicial (datetime.date). Si es None, usa hoy.
             end_date: Fecha final (datetime.date). Si es None, usa hoy.
+            save_only: Si True, guarda el HTML en digest_preview.html y NO envía el correo.
         """
+        # Fechas explícitas (antes de rellenar con "hoy"): determinan qué calendario mostrar
+        explicit_start, explicit_end = start_date, end_date
+
         print("\n" + "=" * 70)
         print("📧 GENERADOR DE RESUMEN DIARIO - OUTLOOK")
         print("=" * 70)
@@ -769,10 +1150,31 @@ class OutlookDailyDigest:
             date_range_str = f"{start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
             subject = f"📧 Resumen de Correos - {date_range_str}"
         
+        # Agenda del calendario (hoy antes de las 18:00, mañana después; o el rango explícito)
+        if self.CALENDAR_ENABLED:
+            cal_range = self.get_calendar_range(explicit_start, explicit_end)
+            if cal_range is None:
+                print("\n🗓️  Agenda omitida (solo se incluye en la corrida de la noche)")
+            else:
+                cal_first, cal_last = cal_range
+                email_data['calendar'] = self.get_calendar_events(cal_first, cal_last)
+                if cal_first == cal_last:
+                    email_data['calendar_label'] = cal_first.strftime('%d/%m/%Y')
+                else:
+                    email_data['calendar_label'] = f"{cal_first.strftime('%d/%m/%Y')} a {cal_last.strftime('%d/%m/%Y')}"
+
         # Generar HTML
         print("\n🎨 Generando reporte HTML...")
         html_content = self.generate_html_report(email_data, date_range_str=date_range_str)
-        
+        print(f"   Tamaño del HTML: {len(html_content.encode('utf-8')) / 1024:.1f} KB")
+
+        if save_only:
+            out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'digest_preview.html')
+            with open(out_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            print(f"💾 Vista previa guardada en {out_path} (NO se envió ningún correo)")
+            return True
+
         # Enviar correo
         print(f"📤 Enviando resumen a {self.GMAIL_RECIPIENT}...")
         success = self.send_digest_email(html_content, subject=subject)
@@ -819,6 +1221,18 @@ Ejemplos de uso:
         help='NO eliminar correos, solo generar resumen (modo automático)'
     )
     
+    parser.add_argument(
+        '--no-send',
+        action='store_true',
+        help='No enviar el correo: guarda el HTML en digest_preview.html (para probar)'
+    )
+
+    parser.add_argument(
+        '--force-calendar',
+        action='store_true',
+        help='Incluir la agenda de mañana aunque sea antes de la hora de corte (para pruebas)'
+    )
+
     parser.add_argument(
         '--date',
         type=str,
@@ -919,9 +1333,11 @@ Ejemplos de uso:
     
     # Crear generador de resumen
     digest = OutlookDailyDigest()
-    
+    digest.FORCE_CALENDAR = args.force_calendar
+
     # Generar y enviar
-    digest.generate_and_send_digest(delete_otros=delete_otros, start_date=start_date, end_date=end_date)
+    digest.generate_and_send_digest(delete_otros=delete_otros, start_date=start_date,
+                                    end_date=end_date, save_only=args.no_send)
 
 
 if __name__ == "__main__":
